@@ -112,6 +112,84 @@ final class JsonParentRefFixture
     public $parentIds = [10, 20];
 }
 
+// --- Родители для тестов дополнительных веток ---
+
+final class M2MParentFixture
+{
+    public int $id = 800;
+}
+
+final class AssocParentFixture
+{
+    public int $id = 900;
+}
+
+final class UninitParentFixture
+{
+    public int $id = 1000;
+}
+
+final class JsonChildParentFixture
+{
+    public int $id = 1100;
+}
+
+/** M2M-связь на стороне РОДИТЕЛЯ: id родителей берутся из join-таблицы через DBAL. */
+#[RelationTo(
+    entity: M2MParentFixture::class,
+    field: 'id',
+    type: RelationType::REFERENCE,
+    cascade: DeletionCascade::NONE,
+    joinTable: 'm2m_rel',
+    joinColumn: 'parent_col',
+    inverseJoinColumn: 'child_col'
+)]
+final class ManyToManyChildFixture
+{
+    public int $id = 7;
+}
+
+/** FK как объект-ассоциация: id должен извлекаться из связанной сущности, а не попадать объектом. */
+#[RelationTo(
+    entity: AssocParentFixture::class,
+    field: 'parent',
+    type: RelationType::REFERENCE,
+    cascade: DeletionCascade::NONE
+)]
+final class AssociationChildFixture
+{
+    public int $id = 950;
+    public ?AssocParentFixture $parent = null;
+}
+
+/** Неинициализированное typed-свойство FK: чтение не должно бросать Error. */
+#[RelationTo(
+    entity: UninitParentFixture::class,
+    field: 'parentId',
+    type: RelationType::REFERENCE,
+    cascade: DeletionCascade::NONE
+)]
+final class UninitializedFkFixture
+{
+    public int $id = 60;
+    public int $parentId; // без значения по умолчанию — не инициализировано
+}
+
+/** Дочерняя связь через JSON-поле (child-side, findByJsonContains). */
+#[RelationTo(
+    entity: JsonChildParentFixture::class,
+    field: 'parentRef',
+    type: RelationType::BLOCKING,
+    cascade: DeletionCascade::DELETE_CHILD
+)]
+final class JsonChildFixture
+{
+    public int $id = 8;
+
+    /** @var array<int|string>|string */
+    public $parentRef = [];
+}
+
 /** Несколько RelationTo на одном классе (две независимые родительские связи). */
 #[RelationTo(
     entity: MultiParentAFixture::class,

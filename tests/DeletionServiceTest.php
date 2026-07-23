@@ -4,21 +4,31 @@ declare(strict_types=1);
 
 namespace Shared\Deletion\Tests;
 
+use Doctrine\DBAL\Connection;
+use Doctrine\DBAL\Platforms\AbstractPlatform;
 use Doctrine\ORM\EntityManagerInterface;
 use Doctrine\ORM\Mapping\ClassMetadata;
 use Doctrine\ORM\Mapping\ClassMetadataFactory;
 use PHPUnit\Framework\TestCase;
 use Shared\Deletion\DeletionService;
 use Shared\Deletion\Enum\DeletionCascade;
+use Shared\Deletion\Tests\Fixture\AssociationChildFixture;
+use Shared\Deletion\Tests\Fixture\AssocParentFixture;
 use Shared\Deletion\Tests\Fixture\ChildScalarFixture;
 use Shared\Deletion\Tests\Fixture\DetachChildFixture;
 use Shared\Deletion\Tests\Fixture\DetachParentFixture;
 use Shared\Deletion\Tests\Fixture\IsolatedFixture;
+use Shared\Deletion\Tests\Fixture\JsonChildFixture;
+use Shared\Deletion\Tests\Fixture\JsonChildParentFixture;
 use Shared\Deletion\Tests\Fixture\JsonParentRefFixture;
+use Shared\Deletion\Tests\Fixture\ManyToManyChildFixture;
+use Shared\Deletion\Tests\Fixture\M2MParentFixture;
 use Shared\Deletion\Tests\Fixture\MultiParentChildFixture;
 use Shared\Deletion\Tests\Fixture\NoneBlockingChildFixture;
 use Shared\Deletion\Tests\Fixture\NoneParentFixture;
 use Shared\Deletion\Tests\Fixture\ScalarParentFixture;
+use Shared\Deletion\Tests\Fixture\UninitializedFkFixture;
+use Shared\Deletion\Tests\Fixture\UninitParentFixture;
 use Shared\Persistence\GenericReadRepository;
 
 /**
@@ -38,11 +48,16 @@ final class DeletionServiceTest extends TestCase
         NoneBlockingChildFixture::class,
         JsonParentRefFixture::class,
         MultiParentChildFixture::class,
+        ManyToManyChildFixture::class,
+        AssociationChildFixture::class,
+        UninitializedFkFixture::class,
+        JsonChildFixture::class,
     ];
 
     /** Классы, у которых поле трактуется Doctrine как json. */
     private const JSON_FIELDS = [
         JsonParentRefFixture::class => ['parentIds' => ['type' => 'json']],
+        JsonChildFixture::class => ['parentRef' => ['type' => 'json']],
     ];
 
     public function testEntityWithoutRelationsCanBeDeleted(): void
@@ -169,11 +184,74 @@ final class DeletionServiceTest extends TestCase
         self::assertSame(DeletionCascade::DELETE_CHILD, $rules[0]->cascade);
     }
 
+    public function testManyToManyParentIdsResolvedViaJoinTable(): void
+    {
+        // getJoinTableParentIds идёт native SQL через DBAL (F3) — мокаем Connection/Platform.
+        $platform = $this->createMock(AbstractPlatform::class);
+        $platform->method('quoteIdentifier')->willReturnArgument(0);
+        $conn = $this->createMock(Connection::class);
+        $conn->method('getDatabasePlatform')->willReturn($platform);
+        $conn->method('fetchFirstColumn')->willReturn([900]);
+
+        $analysis = $this->service($this->finder(), $conn)->analyze(new ManyToManyChildFixture());
+
+        self::assertCount(1, $analysis->parents);
+        self::assertSame(M2MParentFixture::class, $analysis->parents[0]->childClass);
+        self::assertSame([900], array_values($analysis->parents[0]->ids));
+    }
+
+    public function testAssociationObjectIsResolvedToItsId(): void
+    {
+        // FK-поле хранит объект-ассоциацию — в ids должен попасть id связанной сущности, а не объект (F4).
+        $child = new AssociationChildFixture();
+        $child->parent = new AssocParentFixture(); // id = 900
+
+        $analysis = $this->service($this->finder())->analyze($child);
+
+        self::assertCount(1, $analysis->parents);
+        self::assertSame([900], array_values($analysis->parents[0]->ids));
+    }
+
+    public function testUninitializedForeignKeyYieldsNoParentsWithoutError(): void
+    {
+        // Чтение неинициализированного typed-свойства не должно бросать Error (F5).
+        $analysis = $this->service($this->finder())->analyze(new UninitializedFkFixture());
+
+        self::assertSame([], $analysis->parents);
+    }
+
+    public function testNoneReferenceChildrenAreNotQueried(): void
+    {
+        // NONE + REFERENCE ни на что не влияет — БД не трогаем (F17).
+        $finder = $this->createMock(GenericReadRepository::class);
+        $finder->method('getId')->willReturnCallback(static fn (object $o): int => $o->id);
+        $finder->expects(self::never())->method('findByAssociation');
+        $finder->method('findByJoinTable')->willReturn([]);
+        $finder->method('findByJsonContains')->willReturn([]);
+
+        $analysis = $this->service($finder)->analyze(new UninitParentFixture());
+
+        self::assertSame([], $analysis->childrenDelete);
+        self::assertSame([], $analysis->childrenDetach);
+        self::assertTrue($analysis->canDelete);
+    }
+
+    public function testChildJsonRelationIsResolvedViaFindByJsonContains(): void
+    {
+        $finder = $this->finder(byJson: [new JsonChildFixture()]);
+
+        $analysis = $this->service($finder)->analyze(new JsonChildParentFixture());
+
+        self::assertCount(1, $analysis->childrenDelete);
+        self::assertSame(JsonChildFixture::class, $analysis->childrenDelete[0]->childClass);
+        self::assertFalse($analysis->canDelete);
+    }
+
     // ---- helpers ----
 
-    private function service(GenericReadRepository $finder): DeletionService
+    private function service(GenericReadRepository $finder, ?Connection $connection = null): DeletionService
     {
-        return new DeletionService($this->entityManager(), $finder);
+        return new DeletionService($this->entityManager($connection), $finder);
     }
 
     /**
@@ -195,7 +273,7 @@ final class DeletionServiceTest extends TestCase
         return $finder;
     }
 
-    private function entityManager(): EntityManagerInterface
+    private function entityManager(?Connection $connection = null): EntityManagerInterface
     {
         $factory = $this->createMock(ClassMetadataFactory::class);
         $factory->method('getAllMetadata')->willReturn(
@@ -205,6 +283,9 @@ final class DeletionServiceTest extends TestCase
         $em = $this->createMock(EntityManagerInterface::class);
         $em->method('getMetadataFactory')->willReturn($factory);
         $em->method('getClassMetadata')->willReturnCallback(fn (string $class): ClassMetadata => $this->metadataFor($class));
+        if ($connection !== null) {
+            $em->method('getConnection')->willReturn($connection);
+        }
 
         return $em;
     }
@@ -213,6 +294,8 @@ final class DeletionServiceTest extends TestCase
     {
         $meta = $this->createMock(ClassMetadata::class);
         $meta->method('getName')->willReturn($class);
+        // Идентификатор извлекаем из публичного поля id фикстуры (используется для объектов-ассоциаций).
+        $meta->method('getIdentifierValues')->willReturnCallback(static fn (object $e): array => ['id' => $e->id]);
         $meta->fieldMappings = self::JSON_FIELDS[$class] ?? [];
 
         return $meta;
