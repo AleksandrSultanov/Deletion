@@ -17,33 +17,65 @@ final class LoggingDeletionMiddleware implements DeletionMiddlewareInterface
         return true;
     }
 
-    public function beforeDetachRelations(string $parentClass, string $childClass, array $childIds, array $relation, object $root): void
+    public function beforeDetachRelations(string $parentClass, string $childClass, array $childIds, array $relation, object $root, bool $dryRun): void
     {
-        $this->logger->info('Detach relations', compact('parentClass', 'childClass', 'childIds', 'relation'));
+        $this->logger->info('Detach relations', $this->detachContext($parentClass, $childClass, $childIds, $root, $dryRun));
     }
 
-    public function afterDetachRelations(string $parentClass, string $childClass, array $childIds, array $relation, object $root): void
+    public function afterDetachRelations(string $parentClass, string $childClass, array $childIds, array $relation, object $root, bool $dryRun): void
     {
-        $this->logger->info('Detached relations', compact('parentClass', 'childClass', 'childIds', 'relation'));
+        $this->logger->info('Detached relations', $this->detachContext($parentClass, $childClass, $childIds, $root, $dryRun));
     }
 
-    public function beforeDeleteChildren(string $childClass, array $childIds, object $root): void
+    public function beforeDeleteChildren(string $childClass, array $childIds, object $root, bool $dryRun): void
     {
-        $this->logger->info('Delete children', compact('childClass', 'childIds'));
+        $this->logger->info('Delete children', $this->childrenContext($childClass, $childIds, $root, $dryRun));
     }
 
-    public function afterDeleteChildren(string $childClass, array $childIds, object $root): void
+    public function afterDeleteChildren(string $childClass, array $childIds, object $root, bool $dryRun): void
     {
-        $this->logger->info('Deleted children', compact('childClass', 'childIds'));
+        $this->logger->info('Deleted children', $this->childrenContext($childClass, $childIds, $root, $dryRun));
     }
 
-    public function beforeDeleteRoot(object $root): void
+    public function beforeDeleteRoot(object $root, bool $dryRun): void
     {
-        $this->logger->info('Delete root start', ['class' => $root::class]);
+        $this->logger->info('Delete root start', ['root' => $root::class, 'dryRun' => $dryRun]);
     }
 
-    public function afterDeleteRoot(object $root): void
+    public function afterDeleteRoot(object $root, bool $dryRun): void
     {
-        $this->logger->info('Delete root done', ['class' => $root::class]);
+        $this->logger->info('Delete root done', ['root' => $root::class, 'dryRun' => $dryRun]);
+    }
+
+    /**
+     * @param list<int|string> $childIds
+     *
+     * @return array<string, mixed>
+     */
+    private function detachContext(string $parentClass, string $childClass, array $childIds, object $root, bool $dryRun): array
+    {
+        return [
+            'root' => $root::class,
+            'parentClass' => $parentClass,
+            'childClass' => $childClass,
+            // Логируем количество, а не весь список id — чтобы не раздувать лог на массовых операциях.
+            'childCount' => count($childIds),
+            'dryRun' => $dryRun,
+        ];
+    }
+
+    /**
+     * @param list<int|string> $childIds
+     *
+     * @return array<string, mixed>
+     */
+    private function childrenContext(string $childClass, array $childIds, object $root, bool $dryRun): array
+    {
+        return [
+            'root' => $root::class,
+            'childClass' => $childClass,
+            'childCount' => count($childIds),
+            'dryRun' => $dryRun,
+        ];
     }
 }

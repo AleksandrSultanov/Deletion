@@ -8,21 +8,25 @@ use Doctrine\ORM\EntityManagerInterface;
 use Doctrine\ORM\Mapping\ClassMetadata;
 use ReflectionClass;
 use Shared\Deletion\Attribute\RelationTo;
-use Shared\Deletion\Dto\{CanDeleteDto, DependentGroupDto, RelationsDto};
+use Shared\Deletion\Dto\{CanDeleteDto, DependentGroupDto, RelationRule, RelationsDto};
 use Shared\Deletion\Enum\{DeletionCascade, RelationType};
 use Shared\Persistence\GenericReadRepository;
 
 final class DeletionService
 {
-    /** @var array<string, list<array{0:string,1:string,2:bool,3:?string,4:?string,5:?string,6:?string}>> parentFqcn => [[childFqcn, field, isBlocking, joinTable, joinColumn, inverseJoinColumn, cascade], ...] */
+    /** @var array<string, list<RelationRule>>|null parentFqcn => правила связей */
     private ?array $map = null;
+
+    /** @var array<string, ClassMetadata> */
     private array $metadataCache = [];
+
+    /** @var array<string, ReflectionClass> */
+    private array $reflectionCache = [];
 
     public function __construct(
         private readonly EntityManagerInterface $em,
         private readonly GenericReadRepository $finder
-    )
-    {
+    ) {
     }
 
     public function canDelete(object $object): CanDeleteDto
@@ -42,17 +46,9 @@ final class DeletionService
         $parents = $this->findParentsByAttributes($object);
         [$childrenDelete, $childrenDetach] = $this->findChildrenByAttributes($object);
 
-        // Блокируем если есть ЖЁСТКИЕ зависимости от родителей
-        $hasHardParent = false;
-        foreach ($parents as $group) {
-            if ($group->hard && $group->count > 0) {
-                $hasHardParent = true;
-                break;
-            }
-        }
-
-        // Блокируем если есть ЖЁСТКИЕ дочерние зависимости (BLOCKING children)
-        // Только для DELETE_CHILD, потому что DETACH_RELATIONS не должен блокировать родителя
+        // Блокируют удаление только ЖЁСТКИЕ childrenDelete. Родительские связи всегда информационные
+        // (isBlocking=false, см. CLAUDE.md: BLOCKING на ребёнке блокирует РОДИТЕЛЯ, а не сам объект) —
+        // поэтому отдельной проверки по $parents здесь нет (была мёртвой, F12).
         $hasHardChildren = false;
         foreach ($childrenDelete as $group) {
             if ($group->hard && $group->count > 0) {
@@ -60,14 +56,12 @@ final class DeletionService
                 break;
             }
         }
-        // childrenDetach (DETACH_RELATIONS) НЕ блокирует удаление родителя,
-        // даже если связь помечена как BLOCKING (BLOCKING блокирует удаление дочерней сущности, а не родителя)
 
         return new RelationsDto(
             parents: $parents,
             childrenDelete: $childrenDelete,
             childrenDetach: $childrenDetach,
-            canDelete: !$hasHardParent && !$hasHardChildren,
+            canDelete: !$hasHardChildren,
         );
     }
 
@@ -77,84 +71,64 @@ final class DeletionService
             return;
         }
 
-        $this->map = [];
+        $map = [];
 
         foreach ($this->em->getMetadataFactory()->getAllMetadata() as $meta) {
             $fqcn = $meta->getName();
-            $rc = new ReflectionClass($fqcn);
 
-            // Новый атрибут RelationTo
-            foreach ($rc->getAttributes(RelationTo::class) as $attributeRef) {
+            foreach ($this->reflection($fqcn)->getAttributes(RelationTo::class) as $attributeRef) {
                 /** @var RelationTo $attribute */
                 $attribute = $attributeRef->newInstance();
-                $isBlocking = $attribute->type === RelationType::BLOCKING;
-                $this->map[$attribute->entity][] = [
-                    $fqcn,
-                    $attribute->field,
-                    $isBlocking,
-                    $attribute->joinTable,
-                    $attribute->joinColumn,
-                    $attribute->inverseJoinColumn,
-                    $attribute->cascade->value,
-                ];
+
+                $map[$attribute->entity][] = new RelationRule(
+                    childClass: $fqcn,
+                    field: $attribute->field,
+                    isBlocking: $attribute->type === RelationType::BLOCKING,
+                    cascade: $attribute->cascade,
+                    joinTable: $attribute->joinTable,
+                    joinColumn: $attribute->joinColumn,
+                    inverseJoinColumn: $attribute->inverseJoinColumn,
+                );
             }
         }
+
+        $this->map = $map;
     }
 
     /**
-     * Ищет зависимости текущей сущности от родительских сущностей.
+     * Ищет зависимости текущей сущности от родительских (объект как «ребёнок»).
      *
-     * @param object $object
-     *
-     * @return DependentGroupDto[]
+     * @return list<DependentGroupDto>
      */
     private function findParentsByAttributes(object $object): array
     {
         $entityClass = $object::class;
-        $rc = new ReflectionClass($entityClass);
         $dependencies = [];
 
-        foreach ($rc->getAttributes(RelationTo::class) as $attributeRef) {
+        foreach ($this->reflection($entityClass)->getAttributes(RelationTo::class) as $attributeRef) {
             /** @var RelationTo $attribute */
             $attribute = $attributeRef->newInstance();
-            // Родительские связи НИКОГДА не должны блокировать удаление текущей сущности
-            // BLOCKING на дочерней сущности означает "нельзя удалить РОДИТЕЛЯ", а не саму дочернюю сущность
-            $isBlocking = false;
-            $isJsonField = $this->isJsonField($entityClass, $attribute->field);
 
-            if ($isJsonField) {
-                // Поиск по JSON массиву
+            // Родительская связь никогда не блокирует сам объект ⇒ hard=false.
+            if ($this->isJsonField($entityClass, $attribute->field)) {
                 $parentIds = $this->getJsonArrayParentIds($object, $attribute->field);
-                if (!empty($parentIds)) {
-                    $dependencies[] = new DependentGroupDto(
-                        $attribute->entity,
-                        $isBlocking,
-                        count($parentIds),
-                        $parentIds,
-                        $attribute->field
-                    );
+                if ($parentIds !== []) {
+                    $dependencies[] = DependentGroupDto::of($attribute->entity, false, $parentIds, $attribute->field);
                 }
-            } elseif ($attribute->joinTable !== null && $attribute->joinColumn !== null && $attribute->inverseJoinColumn !== null) {
-                $parentIds = $this->getJoinTableParentIds($object, $attribute->joinTable, $attribute->joinColumn, $attribute->inverseJoinColumn);
-                if (!empty($parentIds)) {
-                    $dependencies[] = new DependentGroupDto(
-                        $attribute->entity,
-                        $isBlocking,
-                        count($parentIds),
-                        $parentIds,
-                        $attribute->field
-                    );
+            } elseif ($this->isJoinTableRelation($attribute)) {
+                $parentIds = $this->getJoinTableParentIds(
+                    $object,
+                    $attribute->joinTable,
+                    $attribute->joinColumn,
+                    $attribute->inverseJoinColumn
+                );
+                if ($parentIds !== []) {
+                    $dependencies[] = DependentGroupDto::of($attribute->entity, false, $parentIds, $attribute->field);
                 }
             } else {
-                $parentId = $this->getScalarFkValue($object, $attribute->field);
+                $parentId = $this->getForeignKeyValue($object, $attribute->field);
                 if ($parentId !== null && $parentId !== 0 && $parentId !== '') {
-                    $dependencies[] = new DependentGroupDto(
-                        $attribute->entity,
-                        $isBlocking,
-                        1,
-                        [$parentId],
-                        $attribute->field
-                    );
+                    $dependencies[] = DependentGroupDto::of($attribute->entity, false, [$parentId], $attribute->field);
                 }
             }
         }
@@ -163,133 +137,137 @@ final class DeletionService
     }
 
     /**
-     * Получает ID родительских сущностей из JSON массива.
+     * ID родителей из JSON-массива. Сохраняет валидные числовые id (в т.ч. 0), отбрасывает пустые строки,
+     * переиндексирует результат в list (F13).
      *
-     * @param object $object
-     * @param string $jsonField
-     *
-     * @return array<int|string>
+     * @return list<int|string>
      */
     private function getJsonArrayParentIds(object $object, string $jsonField): array
     {
-        $reflection = new ReflectionClass($object);
-        if (!$reflection->hasProperty($jsonField)) {
-            return [];
-        }
-        $property = $reflection->getProperty($jsonField);
-        $property->setAccessible(true);
-        $jsonValue = $property->getValue($object);
+        $value = $this->readProperty($object, $jsonField);
 
-        if (empty($jsonValue)) {
-            return [];
-        }
-
-        if (is_string($jsonValue)) {
-            $jsonValue = json_decode($jsonValue, true);
+        if (is_string($value)) {
+            $decoded = json_decode($value, true);
             if (json_last_error() !== JSON_ERROR_NONE) {
                 return [];
             }
+            $value = $decoded;
         }
 
-        if (!is_array($jsonValue)) {
+        if (!is_array($value)) {
             return [];
         }
 
-        return array_filter($jsonValue, static fn ($id) => is_numeric($id) || is_string($id));
+        $ids = array_filter(
+            $value,
+            static fn ($id): bool => is_int($id) || (is_string($id) && $id !== '')
+        );
+
+        return array_values($ids);
     }
 
     /**
-     * Получает ID всех родительских сущностей, связанных через промежуточную таблицу.
+     * ID родителей, связанных через промежуточную таблицу. Native SQL через DBAL — join-таблица не
+     * является Doctrine-сущностью, поэтому DQL здесь неприменим (F3). Идентификаторы квотируются (F22).
      *
-     * @param object $object
-     * @param string $joinTable
-     * @param string $joinColumn
-     * @param string $inverseJoinColumn
-     *
-     * @return array<int|string>
+     * @return list<int|string>
      */
     private function getJoinTableParentIds(object $object, string $joinTable, string $joinColumn, string $inverseJoinColumn): array
     {
         $objectId = $this->finder->getId($object);
 
-        $qb = $this->em->createQueryBuilder();
-        $qb->select("jt.{$joinColumn}")
-            ->from($joinTable, 'jt')
-            ->where("jt.{$inverseJoinColumn} = :objectId")
-            ->setParameter('objectId', $objectId)
-        ;
+        $conn = $this->em->getConnection();
+        $platform = $conn->getDatabasePlatform();
 
-        $result = $qb->getQuery()->getArrayResult();
+        $sql = sprintf(
+            'SELECT %s FROM %s WHERE %s = ?',
+            $platform->quoteIdentifier($joinColumn),
+            $platform->quoteIdentifier($joinTable),
+            $platform->quoteIdentifier($inverseJoinColumn)
+        );
 
-        return array_map(static fn ($row) => $row[$joinColumn], $result);
+        /** @var list<int|string> $result */
+        $result = $conn->fetchFirstColumn($sql, [$objectId]);
+
+        return array_values($result);
     }
 
-    private function getScalarFkValue(object $object, string $field): int|string|null
+    /**
+     * Значение внешнего ключа. Различает скалярный FK и объект-ассоциацию: для ассоциации возвращает
+     * идентификатор связанной сущности, а не сам объект/proxy (F4). Неинициализированные typed-свойства
+     * не приводят к Error (F5).
+     */
+    private function getForeignKeyValue(object $object, string $field): int|string|null
     {
-        $reflection = new ReflectionClass($object);
+        $value = $this->readProperty($object, $field);
+
+        if ($value === null) {
+            return null;
+        }
+
+        if (is_object($value)) {
+            return $this->extractId($value);
+        }
+
+        return is_int($value) || is_string($value) ? $value : null;
+    }
+
+    private function extractId(object $entity): int|string|null
+    {
+        $ids = $this->getEntityMetadata($entity::class)->getIdentifierValues($entity);
+        $first = array_values($ids)[0] ?? null;
+
+        return is_int($first) || is_string($first) ? $first : null;
+    }
+
+    /**
+     * Безопасно читает значение свойства через Reflection: отсутствующее или неинициализированное
+     * typed-свойство даёт null вместо исключения (F5). setAccessible не нужен на PHP 8.1+ (F18).
+     */
+    private function readProperty(object $object, string $field): mixed
+    {
+        $reflection = $this->reflection($object::class);
         if (!$reflection->hasProperty($field)) {
             return null;
         }
 
         $property = $reflection->getProperty($field);
-        $property->setAccessible(true);
+        if (!$property->isInitialized($object)) {
+            return null;
+        }
 
-        // @var int|string|null $value
         return $property->getValue($object);
     }
 
     /**
-     * Ищет дочерние записи на основе карты атрибутов (child-классы, зависящие от нас).
+     * Ищет дочерние записи по карте (child-классы, зависящие от нас).
      *
-     * @param object $object
-     *
-     * @return DependentGroupDto[]
+     * @return array{0: list<DependentGroupDto>, 1: list<DependentGroupDto>} [childrenDelete, childrenDetach]
      */
     private function findChildrenByAttributes(object $object): array
     {
         $childrenDelete = [];
         $childrenDetach = [];
         $parentClass = $object::class;
-        $parentId = $this->finder->getId($object);
-        foreach ($this->map[$parentClass] ?? [] as [$childClass, $field, $hard, $joinTable, $joinColumn, $inverseJoinColumn, $cascade]) {
-            $ids = [];
-            $isDelete = $cascade === DeletionCascade::DELETE_CHILD->value;
-            $isDetach = $cascade === DeletionCascade::DETACH_RELATIONS->value;
-            $isJsonField = $this->isJsonField($childClass, $field);
 
-            if ($isJsonField) {
-               $childEntities = $this->finder->findByJsonContains(
-                   entityClass: $childClass,
-                   field: $field,
-                   value: $parentId
-               );
-                foreach ($childEntities as $child) {
-                    $ids[] = $this->finder->getId($child);
-                }
-            } elseif ($joinTable !== null && $joinColumn !== null && $inverseJoinColumn !== null) {
-                // Дети через join table: выберем детей и соберем их id
-                $childEntities = $this->finder->findByJoinTable($childClass, $joinTable, $joinColumn, $inverseJoinColumn, $object);
-                foreach ($childEntities as $child) {
-                    $ids[] = $this->finder->getId($child);
-                }
-            } else {
-                // Прямая ссылка: фильтрация по scalar FK у ребенка
-                $children = $this->finder->findByAssociation($childClass, $field, $object);
-                foreach ($children as $child) {
-                    $ids[] = $this->finder->getId($child);
-                }
+        foreach ($this->map[$parentClass] ?? [] as $rule) {
+            // NONE + REFERENCE не влияет ни на блокировку, ни на каскад — не тратим запрос в БД (F17).
+            if ($rule->cascade === DeletionCascade::NONE && !$rule->isBlocking) {
+                continue;
             }
 
-            if ($ids !== []) {
-                if ($isDelete) {
-                    $childrenDelete[] = new DependentGroupDto($childClass, $hard, count($ids), $ids, $field);
-                } elseif ($isDetach) {
-                    $childrenDetach[] = new DependentGroupDto($childClass, $hard, count($ids), $ids, $field);
-                } elseif ($hard) {
-                    // Для BLOCKING связей с cascade=NONE всё равно добавляем в childrenDelete,
-                    // чтобы они учитывались при проверке возможности удаления
-                    $childrenDelete[] = new DependentGroupDto($childClass, $hard, count($ids), $ids, $field);
-                }
+            $ids = $this->collectChildIds($object, $rule);
+            if ($ids === []) {
+                continue;
+            }
+
+            if ($rule->cascade === DeletionCascade::DELETE_CHILD) {
+                $childrenDelete[] = DependentGroupDto::of($rule->childClass, $rule->isBlocking, $ids, $rule->field);
+            } elseif ($rule->cascade === DeletionCascade::DETACH_RELATIONS) {
+                $childrenDetach[] = DependentGroupDto::of($rule->childClass, $rule->isBlocking, $ids, $rule->field);
+            } elseif ($rule->isBlocking) {
+                // NONE + BLOCKING: не каскадим, но связь блокирует удаление родителя — учитываем.
+                $childrenDelete[] = DependentGroupDto::of($rule->childClass, $rule->isBlocking, $ids, $rule->field);
             }
         }
 
@@ -297,17 +275,53 @@ final class DeletionService
     }
 
     /**
-     * Возвращает правила дочерних связей для заданного родителя из карты.
+     * @return list<int|string>
+     */
+    private function collectChildIds(object $object, RelationRule $rule): array
+    {
+        if ($this->isJsonField($rule->childClass, $rule->field)) {
+            $children = $this->finder->findByJsonContains(
+                entityClass: $rule->childClass,
+                field: $rule->field,
+                value: $this->finder->getId($object)
+            );
+        } elseif ($rule->isJoinTable()) {
+            $children = $this->finder->findByJoinTable(
+                $rule->childClass,
+                $rule->joinTable,
+                $rule->joinColumn,
+                $rule->inverseJoinColumn,
+                $object
+            );
+        } else {
+            $children = $this->finder->findByAssociation($rule->childClass, $rule->field, $object);
+        }
+
+        $ids = [];
+        foreach ($children as $child) {
+            $ids[] = $this->finder->getId($child);
+        }
+
+        return $ids;
+    }
+
+    /**
+     * Правила дочерних связей для заданного родителя.
      *
-     * @param string $parentClass
-     *
-     * @return list<array{0:string,1:string,2:bool,3:?string,4:?string,5:?string,6:?string}>
+     * @return list<RelationRule>
      */
     public function getChildRelationRules(string $parentClass): array
     {
         $this->ensureMap();
 
         return $this->map[$parentClass] ?? [];
+    }
+
+    private function isJoinTableRelation(RelationTo $attribute): bool
+    {
+        return $attribute->joinTable !== null
+            && $attribute->joinColumn !== null
+            && $attribute->inverseJoinColumn !== null;
     }
 
     private function isJsonField(string $entityClass, string $field): bool
@@ -327,10 +341,11 @@ final class DeletionService
 
     private function getEntityMetadata(string $entityClass): ClassMetadata
     {
-        if (!isset($this->metadataCache[$entityClass])) {
-            $this->metadataCache[$entityClass] = $this->em->getClassMetadata($entityClass);
-        }
+        return $this->metadataCache[$entityClass] ??= $this->em->getClassMetadata($entityClass);
+    }
 
-        return $this->metadataCache[$entityClass];
+    private function reflection(string $class): ReflectionClass
+    {
+        return $this->reflectionCache[$class] ??= new ReflectionClass($class);
     }
 }

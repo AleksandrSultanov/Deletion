@@ -9,6 +9,7 @@ use Doctrine\ORM\Mapping\ClassMetadata;
 use Doctrine\ORM\Mapping\ClassMetadataFactory;
 use PHPUnit\Framework\TestCase;
 use Shared\Deletion\DeletionService;
+use Shared\Deletion\Enum\DeletionCascade;
 use Shared\Deletion\Tests\Fixture\ChildScalarFixture;
 use Shared\Deletion\Tests\Fixture\DetachChildFixture;
 use Shared\Deletion\Tests\Fixture\DetachParentFixture;
@@ -162,10 +163,10 @@ final class DeletionServiceTest extends TestCase
         $rules = $this->service($this->finder())->getChildRelationRules(ScalarParentFixture::class);
 
         self::assertCount(1, $rules);
-        self::assertSame(ChildScalarFixture::class, $rules[0][0]);
-        self::assertSame('parentId', $rules[0][1]);
-        self::assertTrue($rules[0][2]);            // isBlocking
-        self::assertSame('delete', $rules[0][6]);  // cascade
+        self::assertSame(ChildScalarFixture::class, $rules[0]->childClass);
+        self::assertSame('parentId', $rules[0]->field);
+        self::assertTrue($rules[0]->isBlocking);
+        self::assertSame(DeletionCascade::DELETE_CHILD, $rules[0]->cascade);
     }
 
     // ---- helpers ----
